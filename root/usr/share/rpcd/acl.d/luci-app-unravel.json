@@ -1,0 +1,31 @@
+{
+	"luci-app-unravel": {
+		"description": "Grant access to unRAVEL configuration and status",
+		"read": {
+			"ubus": {
+				"unravel": [
+					"status"
+				],
+				"unravel.*": [
+					"status"
+				],
+				"luci": [
+					"getInitList"
+				]
+			},
+			"uci": [
+				"unravel"
+			]
+		},
+		"write": {
+			"ubus": {
+				"luci": [
+					"setInitAction"
+				]
+			},
+			"uci": [
+				"unravel"
+			]
+		}
+	}
+}

@@ -1,0 +1,49 @@
+{
+	"admin/network/unravel": {
+		"title": "unRAVEL",
+		"order": 60,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-unravel"
+			],
+			"uci": {
+				"unravel": true
+			}
+		}
+	},
+	"admin/network/unravel/status": {
+		"title": "Status",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "unravel/status"
+		}
+	},
+	"admin/network/unravel/instances": {
+		"title": "Instances",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "unravel/instances"
+		}
+	},
+	"admin/network/unravel/profiles": {
+		"title": "Profiles",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "unravel/profiles"
+		}
+	},
+	"admin/network/unravel/reflectors": {
+		"title": "Reflectors",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "unravel/reflectors"
+		}
+	}
+}
