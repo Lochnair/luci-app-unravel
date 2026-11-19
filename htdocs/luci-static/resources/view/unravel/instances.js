@@ -95,6 +95,12 @@ return view.extend({
 				return true;
 			};
 
+			o = s.taboption('general', form.Value, dir + '_max_percent', _('%s maximum (%% of base)').format(title),
+				_('Highest rate any law may set. Empty means no maximum. The cake-autorate script law needs it.'));
+			o.datatype = 'and(ufloat,min(100))';
+			o.placeholder = _('no maximum');
+			o.modalonly = true;
+
 			o = s.option(form.DummyValue, '_' + dir, title);
 			o.modalonly = false;
 			o.textvalue = (section_id) => {
