@@ -4,10 +4,14 @@
 		"read": {
 			"ubus": {
 				"unravel": [
-					"status"
+					"status",
+					"history",
+					"reflectors"
 				],
 				"unravel.*": [
-					"status"
+					"status",
+					"history",
+					"reflectors"
 				],
 				"luci": [
 					"getInitList"

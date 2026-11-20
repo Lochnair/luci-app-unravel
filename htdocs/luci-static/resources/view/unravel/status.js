@@ -1,6 +1,5 @@
 'use strict';
 'require dom';
-'require request';
 'require poll';
 'require rpc';
 'require ui';
@@ -10,20 +9,52 @@
 
 const POLL_INTERVAL = 2;
 
-// The graphs follow Status > Realtime Graphs: the same box around an SVG
-// template (unravel/graph.svg, modelled on svg/bandwidth.svg), so themes
-// that restyle those restyle these too.
-const GRAPH_HEIGHT = 300;
-const STEP = 5;			// pixels per sample
-const MAX_SAMPLES = 1000;
-const SERIES = [
-	{ key: 'rate_kbps', line: 'rate', title: _('Shaper rate:'), color: 'blue' },
-	{ key: 'traffic_kbps', line: 'traffic', title: _('Traffic:'), color: 'green' }
-];
 const DIRECTIONS = [
 	{ dir: 'download', title: _('Download') },
 	{ dir: 'upload', title: _('Upload') }
 ];
+
+function formatDelay(us) {
+	if (us == null || isNaN(us))
+		return '-';
+	const ms = us / 1000;
+	return '%s ms'.format(ms.toFixed(Math.abs(ms) < 10 ? 2 : 1));
+}
+
+function formatPercent(pct) {
+	return (pct == null || isNaN(pct)) ? '-' : '%d %%'.format(Math.round(pct));
+}
+
+// The plots of one direction, top to bottom, on one time axis. `series`
+// is the history key, `current` the status key; `refs` are dashed lines
+// the scale always reaches.
+const PLOTS = [
+	{ series: 'rate_kbps', current: 'rate_kbps', title: _('Shaper rate'), color: 'blue', height: 150,
+	  format: common.formatKbits, floor: 1000,
+	  refs: (d) => [ [ d.base_kbps, _('base') ], [ d.min_kbps, _('min') ] ] },
+	{ series: 'traffic_kbps', current: 'traffic_kbps', title: _('Traffic'), color: 'green', height: 110,
+	  format: common.formatKbits, floor: 100,
+	  refs: () => [] },
+	{ series: 'delay_us', current: 'delay_us', title: _('Delay above baseline'), label: _('Delay'), color: '#c60', height: 110,
+	  format: formatDelay, floor: 1000, optional: true,
+	  refs: (d) => d.delay_threshold_us != null ? [ [ d.delay_threshold_us, _('threshold') ] ] : [] }
+];
+
+const PROTOCOLS = {
+	'icmp-echo': _('ICMP echo'),
+	'icmp-timestamps': _('ICMP timestamps'),
+	'irtt': 'IRTT'
+};
+
+const ONE_WAY = {
+	usable: _('usable'),
+	reference_changed: _('reference changed'),
+	invalid_rtt: _('invalid RTT'),
+	inconsistent_timestamps: _('inconsistent timestamps'),
+	directional_discontinuity: _('discontinuity'),
+	local_clock_step: _('local clock step'),
+	out_of_order: _('out of order')
+};
 
 const callInitAction = rpc.declare({
 	object: 'luci',
@@ -40,16 +71,14 @@ const callInitList = rpc.declare({
 });
 
 // Each running instance publishes `unravel` (unnamed) or `unravel.<name>`
-// on ubus. A stopped one has no object, so the call fails.
-const statusCalls = {};
-function callInstanceStatus(name) {
+// on ubus, with `status`, `history` and `reflectors`. A stopped one has no
+// object, so the call fails and resolves to null.
+const calls = {};
+function callInstance(name, method) {
 	const object = (name === 'default') ? 'unravel' : 'unravel.' + name;
-	statusCalls[object] = statusCalls[object] ?? rpc.declare({
-		object,
-		method: 'status',
-		expect: { '': {} }
-	});
-	return L.resolveDefault(statusCalls[object](), null);
+	const key = object + '/' + method;
+	calls[key] = calls[key] ?? rpc.declare({ object, method, expect: { '': {} } });
+	return L.resolveDefault(calls[key](), null);
 }
 
 function svg(tag, attrs, text) {
@@ -94,98 +123,101 @@ function badge(enabled, st) {
 	return E('span', { 'class': 'label ' + cls }, text);
 }
 
-// One direction's graph, cloned from the template, and its
-// current/average/peak table.
-function createGraph(template, title) {
-	const root = template.cloneNode(true);
-	const byId = (id) => root.getElementById(id);
-	const g = {
-		root,
-		title: E('h3', {}, title),
-		box: E('div', { style: 'width:100%;height:%dpx;border:1px solid #000;background:#fff'.format(GRAPH_HEIGHT) }, root),
-		scale: E('small', {}, '-'),
-		series: SERIES.map((s) => byId(s.line)),
-		labels: [ 25, 50, 75 ].map((pct) => [ pct, byId('label_' + pct) ]),
-		times: byId('times'),
-		base: byId('base'),
-		baseLabel: byId('base_label'),
-		textStyle: byId('label_25').getAttribute('style'),
-		cells: SERIES.map(() => [ E('td', { 'class': 'td' }, '-'), E('td', { 'class': 'td' }, '-'), E('td', { 'class': 'td' }, '-') ]),
-		width: 0
-	};
-	g.baseLabel.textContent = _('base');
-
-	g.el = E('div', { style: 'margin-bottom:1.5em' }, [
-		g.title,
-		g.box,
-		E('div', { 'class': 'right' }, g.scale),
-		E('br'),
-		E('table', { 'class': 'table', style: 'width:100%;table-layout:fixed' }, SERIES.map((s, i) => E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td right top' }, E('strong', { style: 'border-bottom:2px solid ' + s.color }, s.title)),
-			g.cells[i][0],
-			E('td', { 'class': 'td right top' }, E('strong', {}, _('Average:'))),
-			g.cells[i][1],
-			E('td', { 'class': 'td right top' }, E('strong', {}, _('Peak:'))),
-			g.cells[i][2]
-		])))
-	]);
-
-	return g;
+function mean(values) {
+	return values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
 }
 
-// Draws the newest samples that fit, right-aligned, one every STEP pixels.
-function drawGraph(g, samples) {
-	const width = g.box.clientWidth;
-	if (!width || !samples.length)
+// The text style of LuCI's realtime graphs (svg/bandwidth.svg).
+const TEXT_STYLE = 'fill:#eee;font-size:9pt;font-family:sans-serif;text-shadow:1px 1px 1px #000';
+const GRID_STYLE = 'stroke:black;stroke-width:0.1';
+
+// One plot: a box around an SVG, as on Status > Realtime Graphs, so themes
+// that restyle those (`#view div[style] > svg`, `line[style]`) restyle
+// these too. Everything is drawn in measured pixels.
+function createPlot(def) {
+	const root = svg('svg', { width: '100%', height: def.height, style: 'display:block;width:100%;height:%dpx'.format(def.height) });
+	const area = svg('polyline', { points: '', style: 'fill:%s;fill-opacity:0.2;stroke:%s;stroke-width:1'.format(def.color, def.color) });
+	const grid = svg('g'), times = svg('g'), refs = svg('g');
+	root.append(area, grid, times, refs);
+	return {
+		def, root, area, grid, times, refs,
+		el: E('div', { style: 'margin-bottom:.4em' }, [
+			E('div', { style: 'display:flex;justify-content:space-between;align-items:baseline' }, [
+				E('strong', { style: 'border-bottom:2px solid ' + def.color }, def.title),
+				E('small', { style: 'opacity:.75' }, '')
+			]),
+			E('div', { style: 'width:100%;border:1px solid #000;background:#fff;margin-top:.2em' }, root)
+		])
+	};
+}
+
+// `values` are oldest first, `capacity` slots span the full width, and the
+// newest value sits on the right edge.
+function drawPlot(p, values, capacity, perMinute, last, refs) {
+	const rect = p.root.getBoundingClientRect();
+	const width = Math.floor(rect.width), height = Math.floor(rect.height);
+	if (!width || !height)
 		return;	// in a hidden tab; drawn when it is shown
-	const height = GRAPH_HEIGHT - 2;
-	const shown = samples.slice(-Math.floor(width / STEP));
-	const last = shown[shown.length - 1];
 
-	// A time marker every minute, as on the realtime graphs.
-	if (width !== g.width) {
-		g.width = width;
-		const perMinute = STEP * 60 / POLL_INTERVAL;
-		g.times.replaceChildren();
-		for (let x = width % perMinute; x < width; x += perMinute) {
-			g.times.appendChild(svg('line', { x1: x, y1: 0, x2: x, y2: '100%', style: 'stroke:black;stroke-width:0.1' }));
-			g.times.appendChild(svg('text', { x: x + 5, y: 15, style: g.textStyle }, Math.round((width - x) / perMinute) + 'm'));
+	let peak = 0;
+	for (const v of values)
+		if (v != null)
+			peak = Math.max(peak, v);
+	for (const [ v ] of refs)
+		peak = Math.max(peak, v ?? 0);
+	// Headroom keeps a reference line and its label off the top edge.
+	const want = Math.max(peak, p.def.floor) * 1.15;
+	const step = niceStep(want, 4);
+	const top = Math.ceil(want / step) * step;
+	const y = (v) => height - Math.round(Math.min(Math.max(v, 0), top) / top * (height - 1));
+	const dx = width / Math.max(capacity - 1, 1);
+	const x = (i) => Math.round(width - (values.length - 1 - i) * dx);
+
+	// Leading nulls (before the first value) are left out; a later gap
+	// holds the previous value.
+	const first = values.findIndex((v) => v != null);
+	let pts = '';
+	if (first >= 0) {
+		let prev = values[first];
+		pts = '%d,%d'.format(x(first), height);
+		for (let i = first; i < values.length; i++) {
+			prev = values[i] ?? prev;
+			pts += ' %d,%d'.format(x(i), y(prev));
 		}
-	}
-
-	let peak = last.base_kbps || 0;
-	for (const s of shown)
-		for (const { key } of SERIES)
-			peak = Math.max(peak, s[key] ?? 0);
-	// Headroom keeps the base line and its label off the top edge.
-	const want = (peak || 1000) * 1.1;
-	const top = Math.ceil(want / niceStep(want, 4)) * niceStep(want, 4);
-	const y = (v) => height - Math.floor(Math.min(v ?? 0, top) / top * height);
-	const x0 = width - (shown.length - 1) * STEP;
-
-	SERIES.forEach(({ key }, i) => {
-		let pts = '%d,%d'.format(x0, height);
-		shown.forEach((s, j) => { pts += ' %d,%d'.format(x0 + j * STEP, y(s[key])); });
 		pts += ' %d,%d'.format(width, height);
-		g.series[i].setAttribute('points', pts);
+	}
+	p.area.setAttribute('points', pts);
 
-		const values = shown.map((s) => s[key]).filter((v) => v != null);
-		g.cells[i][0].textContent = common.formatKbits(last[key]);
-		g.cells[i][1].textContent = values.length ? common.formatKbits(values.reduce((a, b) => a + b, 0) / values.length) : '-';
-		g.cells[i][2].textContent = values.length ? common.formatKbits(Math.max(...values)) : '-';
-	});
+	const lines = [];
+	for (const frac of [ 0.25, 0.5, 0.75 ]) {
+		const gy = y(top * frac);
+		lines.push(svg('line', { x1: 0, y1: gy, x2: width, y2: gy, style: GRID_STYLE }),
+			svg('text', { x: 8, y: gy - 3, style: TEXT_STYLE }, p.def.format(top * frac)));
+	}
+	p.grid.replaceChildren(...lines);
 
-	for (const [ pct, label ] of g.labels)
-		label.firstChild.data = common.formatKbits(top * pct / 100);
+	const marks = [];
+	for (let m = 1; m * perMinute <= capacity; m++) {
+		const mx = Math.round(width - m * perMinute * dx);
+		marks.push(svg('line', { x1: mx, y1: 0, x2: mx, y2: height, style: GRID_STYLE }));
+		if (last)
+			marks.push(svg('text', { x: mx + 4, y: height - 4, style: TEXT_STYLE }, '%dm'.format(m)));
+	}
+	p.times.replaceChildren(...marks);
 
-	const by = last.base_kbps ? y(last.base_kbps) : -10;
-	g.base.setAttribute('y1', by);
-	g.base.setAttribute('y2', by);
-	g.baseLabel.setAttribute('y', by - 4);
+	const dashed = [];
+	for (const [ v, label ] of refs) {
+		if (v == null)
+			continue;
+		const ry = y(v);
+		dashed.push(svg('line', { x1: 0, y1: ry, x2: width, y2: ry, style: 'stroke:black;stroke-width:1;stroke-dasharray:6 4' }),
+			svg('text', { x: width - 8, y: ry - 4, 'text-anchor': 'end', style: TEXT_STYLE }, '%s %s'.format(label, p.def.format(v))));
+	}
+	p.refs.replaceChildren(...dashed);
+}
 
-	g.scale.textContent = _('base %s, minimum %s · (%d minute window, %d second interval)').format(
-		common.formatKbits(last.base_kbps), common.formatKbits(last.min_kbps),
-		Math.floor(width / STEP) * POLL_INTERVAL / 60, POLL_INTERVAL);
+function cell(title, content, cls) {
+	return E('td', { 'class': 'td' + (cls ? ' ' + cls : ''), 'data-title': title }, content);
 }
 
 return view.extend({
@@ -195,13 +227,7 @@ return view.extend({
 	load() {
 		return Promise.all([
 			uci.load('unravel'),
-			L.resolveDefault(callInitList('unravel'), {}),
-			request.get(L.resource('unravel/graph.svg')).then((res) => {
-				if (!res.ok)
-					throw new Error(res.statusText);
-				const doc = new DOMParser().parseFromString(res.text(), 'image/svg+xml');
-				return document.importNode(doc.documentElement, true);
-			})
+			L.resolveDefault(callInitList('unravel'), {})
 		]);
 	},
 
@@ -288,40 +314,148 @@ return view.extend({
 		const pane = {
 			name,
 			enabled: !/^(0|false|no|n|off|disabled)$/i.test(s.enabled ?? '1'),
-			history: [],
 			info: E('div', { style: 'display:flex;align-items:center;flex-wrap:wrap;gap:.3em .6em;margin-bottom:1em' }),
 			message: E('p', { style: 'display:none' }),
-			graphs: {}
+			noHistory: E('p', { style: 'display:none' },
+				_('This unRAVEL version has no history on ubus, so there are no graphs. Update unRAVEL to get them.')),
+			directions: {},
+			reflectors: E('div')
 		};
 
-		const body = DIRECTIONS.map(({ dir, title }) => {
-			const g = pane.graphs[dir] = createGraph(this.template, title);
-			g.missing = E('p', { style: 'display:none' }, _('Not shaped by this instance.'));
-			return E('div', {}, [ g.el, g.missing ]);
+		const body = DIRECTIONS.map(({ dir }) => {
+			const d = pane.directions[dir] = {
+				title: E('h3', {}, ''),
+				plots: PLOTS.map(createPlot),
+				window: E('div', { 'class': 'right' }, E('small', {}, '')),
+				rows: PLOTS.concat([ { title: _('Utilisation'), color: 'transparent' } ]).map((def) => ({
+					def,
+					cells: [ 0, 1, 2 ].map(() => E('td', { 'class': 'td' }, '-'))
+				}))
+			};
+			d.rows.splice(2, 0, d.rows.pop());	// utilisation after traffic
+			d.graphs = E('div', {}, [ ...d.plots.map((p) => p.el), d.window ]);
+			d.table = E('table', { 'class': 'table', style: 'width:100%;table-layout:fixed;margin-top:.5em' }, d.rows.map((r) => {
+				r.el = E('tr', { 'class': 'tr' }, [
+					E('td', { 'class': 'td right top' }, E('strong', {}, (r.def.label ?? r.def.title) + ':')),
+					r.cells[0],
+					E('td', { 'class': 'td right top' }, E('strong', {}, _('Average:'))),
+					r.cells[1],
+					E('td', { 'class': 'td right top' }, E('strong', {}, _('Peak:'))),
+					r.cells[2]
+				]);
+				return r.el;
+			}));
+			d.missing = E('p', { style: 'display:none' }, _('Not shaped by this instance.'));
+			d.content = E('div', {}, [ d.graphs, d.table ]);
+			d.el = E('div', { style: 'margin-bottom:2em' }, [ d.title, d.missing, d.content ]);
+			return d.el;
 		});
-		pane.body = E('div', {}, body);
+
+		pane.body = E('div', {}, [
+			pane.noHistory,
+			...body,
+			E('h3', {}, _('Reflectors')),
+			pane.reflectors
+		]);
 
 		pane.el = E('div', { 'class': 'cbi-section', 'data-tab': name, 'data-tab-title': name }, [
 			pane.info, pane.message, pane.body
 		]);
-		// A graph in a hidden tab has no width; draw it once it is shown.
-		pane.el.addEventListener('cbi-tab-active', () => this.draw(pane));
+		// Only the shown tab fetches its history and reflectors.
+		pane.el.addEventListener('cbi-tab-active', () => this.refreshDetails(pane));
 		return pane;
 	},
 
+	visible(pane) {
+		return this.panes.length === 1 || pane.el.getAttribute('data-tab-active') === 'true';
+	},
+
 	draw(pane) {
-		const st = pane.status;
+		const st = pane.status, hist = pane.history;
 		if (!st)
 			return;
+		pane.noHistory.style.display = hist ? 'none' : '';
+
+		const interval = hist?.interval || POLL_INTERVAL;
+		const capacity = Math.max(2, Math.round((hist?.window || 600) / interval));
+		const perMinute = 60 / interval;
+
 		for (const { dir, title } of DIRECTIONS) {
-			const g = pane.graphs[dir], d = st[dir];
-			g.el.style.display = d ? '' : 'none';
-			g.missing.style.display = d ? 'none' : '';
-			if (!d)
+			const d = pane.directions[dir], cur = st[dir], h = hist?.[dir];
+			d.missing.style.display = cur ? 'none' : '';
+			d.content.style.display = cur ? '' : 'none';
+			d.title.textContent = cur ? '%s (%s)'.format(title, cur.interface) : title;
+			if (!cur)
 				continue;
-			g.title.textContent = '%s (%s)'.format(title, d.interface);
-			drawGraph(g, pane.history.map((h) => h[dir]).filter(Boolean));
+
+			d.graphs.style.display = h ? '' : 'none';
+			const shown = PLOTS.map((def) => !def.optional || h?.[def.series] != null || cur[def.current] != null);
+			d.plots.forEach((p, i) => {
+				p.el.style.display = shown[i] ? '' : 'none';
+				const lastShown = shown.lastIndexOf(true) === i;
+				if (h && shown[i])
+					drawPlot(p, h[p.def.series] ?? [], capacity, perMinute, lastShown, p.def.refs(cur));
+				p.el.firstChild.lastChild.textContent = p.def.format(cur[p.def.current]);
+			});
+			d.window.firstChild.textContent = _('%d minute window, %d second interval').format(
+				Math.round(capacity * interval / 60), interval);
+
+			// Utilisation per slot, where both the rate and traffic are known.
+			const util = (h?.rate_kbps ?? []).map((r, i) => {
+				const t = h.traffic_kbps?.[i];
+				return (r > 0 && t != null) ? t / r * 100 : null;
+			});
+			for (const r of d.rows) {
+				const isUtil = !r.def.series;
+				const values = (isUtil ? util : (h?.[r.def.series] ?? [])).filter((v) => v != null);
+				const format = isUtil ? formatPercent : r.def.format;
+				const now = isUtil
+					? (cur.rate_kbps > 0 && cur.traffic_kbps != null ? cur.traffic_kbps / cur.rate_kbps * 100 : null)
+					: cur[r.def.current];
+				r.el.style.display = (!r.def.optional || shown[PLOTS.indexOf(r.def)]) ? '' : 'none';
+				r.cells[0].textContent = format(now);
+				r.cells[1].textContent = values.length ? format(mean(values)) : '-';
+				r.cells[2].textContent = values.length ? format(Math.max(...values)) : '-';
+			}
 		}
+
+		this.drawReflectors(pane);
+	},
+
+	drawReflectors(pane) {
+		const list = pane.reflectorList;
+		if (list == null) {
+			dom.content(pane.reflectors, E('em', {}, pane.history === null
+				? _('This unRAVEL version does not list its reflectors on ubus.') : _('Loading…')));
+			return;
+		}
+		if (!list.length) {
+			dom.content(pane.reflectors, E('em', {}, _('No reflectors are being probed yet.')));
+			return;
+		}
+
+		const heads = [ _('Reflector'), _('Protocol'), _('Role'), _('Loss'), _('RTT'),
+			_('Average RTT'), _('Minimum RTT'), _('Jitter'), _('Last reply'), _('One-way') ];
+		const ago = (ms) => ms == null ? '-' : (ms < 1000 ? _('%d ms ago').format(ms) : _('%s ago').format(formatDuration(ms / 1000)));
+		// Ten columns don't fit a phone; the table scrolls on its own.
+		dom.content(pane.reflectors, E('div', { style: 'overflow-x:auto' }, E('table', { 'class': 'table cbi-section-table' }, [
+			E('tr', { 'class': 'tr table-titles' }, heads.map((h) => E('th', { 'class': 'th' }, h))),
+			...list.map((r, i) => {
+				const role = r.role === 'active' ? _('Active') : _('Candidate');
+				return E('tr', { 'class': 'tr cbi-rowstyle-%d'.format(i % 2 + 1), style: r.ready ? '' : 'opacity:.6' }, [
+					cell(heads[0], E('code', {}, r.reflector)),
+					cell(heads[1], PROTOCOLS[r.protocol] ?? r.protocol),
+					cell(heads[2], r.ready ? E('strong', {}, role) : _('%s (starting)').format(role)),
+					cell(heads[3], r.probes ? '%s (%d)'.format(formatPercent(r.loss_pct), r.probes) : '-'),
+					cell(heads[4], formatDelay(r.rtt_us)),
+					cell(heads[5], formatDelay(r.rtt_avg_us)),
+					cell(heads[6], formatDelay(r.rtt_min_us)),
+					cell(heads[7], formatDelay(r.jitter_us)),
+					cell(heads[8], ago(r.last_reply_ms)),
+					cell(heads[9], r.one_way ? (ONE_WAY[r.one_way] ?? r.one_way) : '-')
+				]);
+			})
+		])));
 	},
 
 	updatePane(pane, st) {
@@ -338,7 +472,7 @@ return view.extend({
 		]);
 
 		if (!st) {
-			pane.history.length = 0;
+			pane.history = pane.reflectorList = undefined;
 			pane.body.style.display = 'none';
 			pane.message.style.display = '';
 			pane.message.textContent = pane.enabled
@@ -346,27 +480,36 @@ return view.extend({
 				: _('Disabled on the Instances page.');
 			return;
 		}
-
-		pane.history.push({ download: st.download, upload: st.upload });
-		if (pane.history.length > MAX_SAMPLES)
-			pane.history.splice(0, pane.history.length - MAX_SAMPLES);
 		pane.body.style.display = '';
 		pane.message.style.display = 'none';
-		this.draw(pane);
 	},
 
-	refresh() {
-		return Promise.all(this.panes.map((p) => callInstanceStatus(p.name))).then((statuses) => {
-			this.panes.forEach((p, n) => this.updatePane(p, statuses[n]));
-			this.statuses = statuses;
-			this.renderControls();
-			return statuses;
+	// The history and reflectors of one running instance.
+	refreshDetails(pane) {
+		if (!pane.status)
+			return Promise.resolve();
+		return Promise.all([
+			callInstance(pane.name, 'history'),
+			callInstance(pane.name, 'reflectors')
+		]).then(([ hist, refl ]) => {
+			pane.history = hist;
+			pane.reflectorList = refl ? (refl.reflectors ?? []) : (hist === null ? null : undefined);
+			this.draw(pane);
 		});
 	},
 
-	render([ , init, template ]) {
+	refresh() {
+		return Promise.all(this.panes.map((p) => callInstance(p.name, 'status'))).then((statuses) => {
+			this.panes.forEach((p, n) => this.updatePane(p, statuses[n]));
+			this.statuses = statuses;
+			this.renderControls();
+			return Promise.all(this.panes.filter((p) => this.visible(p)).map((p) => this.refreshDetails(p)))
+				.then(() => statuses);
+		});
+	},
+
+	render([ , init ]) {
 		this.init = init;
-		this.template = template;
 		this.controlsEl = E('div', { 'class': 'cbi-section' });
 		this.panes = uci.sections('unravel', 'network').map((s) => this.createPane(s));
 
