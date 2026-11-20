@@ -1,25 +1,27 @@
 'use strict';
 'require baseclass';
 'require form';
-'require ui';
 'require uci';
 
-// Section types a `network` section (an instance) can point at by name, with
-// the option on the instance that holds the reference. They match the
-// sections of the UCI schema in unravel's src/settings/mod.rs.
-const PROFILE_TYPES = [
-	{ type: 'law', title: _('Law') },
-	{ type: 'reflectors', title: _('Reflector selection') },
-	{ type: 'output', title: _('Output') },
-	{ type: 'observability', title: _('Metrics export') },
-	{ type: 'advanced_settings', title: _('Advanced') }
-];
+// Every section of these types belongs to exactly one instance.
+const OWNED_TYPES = [ 'law', 'reflectors', 'output', 'observability', 'reflector', 'bootstrap_reflector' ];
 
-// Built-in laws. Each field is one UCI option in the `law` section, shown
-// only while `type` is that law. LuCI removes the options of inactive fields
-// on save, so switching law leaves none of the old law's options behind,
-// which unravel would reject.
-//
+function ownedSections(type, instance) {
+	return uci.sections('unravel', type).filter((s) => s.instance === instance);
+}
+
+function addOwnedSection(type, instance) {
+	const section_id = uci.add('unravel', type);
+	uci.set('unravel', section_id, 'instance', instance);
+	return section_id;
+}
+
+function removeOwnedSections(instance) {
+	for (const type of OWNED_TYPES)
+		for (const s of ownedSections(type, instance))
+			uci.remove('unravel', s['.name']);
+}
+
 // Defaults and ranges follow SqmaSettings in unravel's src/law/sqma.rs.
 const LAWS = {
 	sqma: {
@@ -71,18 +73,8 @@ const LAWS = {
 	}
 };
 
-const LAW_OPTIONS_RESERVED = [ 'type', 'path' ];
+const LAW_OPTIONS_RESERVED = [ 'instance', 'type', 'path' ];
 
-// The instance name unravel and the init script use: the section name of a
-// named `network` section, `default` for the anonymous one.
-function instanceName(section_id) {
-	const s = uci.get('unravel', section_id);
-	return (s && s['.anonymous']) ? 'default' : section_id;
-}
-
-// Names are shared by all section types in a package, and `default` is the
-// unnamed instance's name. `--instance` accepts letters, digits and `_`,
-// which is exactly what `uciname` allows.
 function validateNewName(name) {
 	if (name == null || name === '')
 		return _('Expecting: %s').format(_('non-empty value'));
@@ -90,70 +82,30 @@ function validateNewName(name) {
 	if (!/^[A-Za-z0-9_]+$/.test(name))
 		return _('Use only letters, digits and underscores');
 
-	if (name === 'default')
-		return _('"default" is reserved for the unnamed instance');
-
 	if (uci.get('unravel', name) != null)
 		return _('A section called "%s" already exists').format(name);
 
 	return true;
 }
 
-// `network` sections whose `option <type>` names this section.
-function referencesTo(type, name) {
-	return uci.sections('unravel', 'network')
-		.filter((s) => s[type] === name)
-		.map((s) => instanceName(s['.name']));
-}
-
-function referenceLabel(type, section_id) {
-	const s = uci.get('unravel', section_id);
-	if (!s)
-		return '?';
-	return s['.anonymous'] ? _('Unnamed') : section_id;
-}
-
-// Adds the "add" name check and the "in use" delete check to a section that
-// edits a referenced type. Works for TypedSection and GridSection.
-function guardSection(section) {
-	const handleAdd = section.handleAdd;
-	const handleRemove = section.handleRemove;
-
-	section.handleAdd = function(ev, name) {
-		if (!this.anonymous) {
-			const valid = validateNewName(name);
-			if (valid !== true) {
-				ui.addTimeLimitedNotification(null, E('p', valid), 5000, 'warning');
-				return Promise.resolve();
-			}
-		}
-		return handleAdd.apply(this, arguments);
-	};
-
-	section.handleRemove = function(section_id) {
-		const users = referencesTo(this.sectiontype, section_id);
-		if (users.length) {
-			ui.addTimeLimitedNotification(null, E('p',
-				_('"%s" is used by %s. Point those instances elsewhere first.')
-					.format(section_id, users.join(', '))), 7000, 'warning');
-			return Promise.resolve();
-		}
-		return handleRemove.apply(this, arguments);
-	};
-
-	return section;
-}
-
-function addLawFields(s, tab) {
-	const opt = (cls, name, title) =>
-		tab ? s.taboption(tab, cls, name, title) : s.option(cls, name, title);
+function addLawFields(s) {
+	const opt = (cls, name, title) => s.option(cls, name, title);
 
 	let o = opt(form.ListValue, 'type', _('Law'));
 	for (const name in LAWS)
 		o.value(name, LAWS[name].title);
 	o.default = 'sqma';
 	o.rmempty = false;
-	o.modalonly = true;
+	o.write = function(section_id, value) {
+		const section = uci.get('unravel', section_id);
+		if ((section.type ?? 'sqma') !== value) {
+			const fields = LAWS[value].fields.map((f) => f.name);
+			for (const key of Object.keys(section))
+				if (key[0] !== '.' && key !== 'instance' && key !== 'type' && !fields.includes(key))
+					uci.unset('unravel', section_id, key);
+		}
+		return form.ListValue.prototype.write.call(this, section_id, value);
+	};
 
 	for (const law in LAWS) {
 		for (const f of LAWS[law].fields) {
@@ -172,14 +124,14 @@ function addLawFields(s, tab) {
 			}
 			o.description = f.description;
 			o.depends('type', law);
-			o.modalonly = true;
+			o.retain = true;
 		}
 
 		if (LAWS[law].freeform) {
 			o = opt(FreeformOptions, '_freeform', _('Script options'));
-			o.description = _('One option per line as <code>name = value</code>. Repeat a name to make a list. These are passed to the script\'s <code>init</code> as its config.');
+			o.description = _('One option per line as <code>name = value</code>. Repeat a name to make a list. Use JSON quotes for a value that contains a line break. These are passed to the script\'s <code>init</code> as its config.');
 			o.depends('type', law);
-			o.modalonly = true;
+			o.retain = true;
 		}
 	}
 }
@@ -197,7 +149,7 @@ const FreeformOptions = form.TextValue.extend({
 
 	_extraOptions(section_id) {
 		const s = uci.get('unravel', section_id) ?? {};
-		const law = LAWS[s.type];
+		const law = LAWS[s.type ?? 'sqma'];
 		const known = new Set(LAW_OPTIONS_RESERVED.concat(law ? law.fields.map((f) => f.name) : []));
 		return Object.keys(s).filter((k) => k[0] !== '.' && !known.has(k)).sort();
 	},
@@ -206,27 +158,37 @@ const FreeformOptions = form.TextValue.extend({
 		const s = uci.get('unravel', section_id) ?? {};
 		const lines = [];
 		for (const k of this._extraOptions(section_id)) {
-			for (const v of L.toArray(s[k]))
-				lines.push('%s = %s'.format(k, v));
+			const values = Array.isArray(s[k]) ? s[k] : [ s[k] ];
+			for (const v of values)
+				lines.push('%s = %s'.format(k, /[\r\n]|^"/.test(v) ? JSON.stringify(v) : v));
 		}
 		return lines.join('\n');
 	},
 
 	_parse(value) {
-		const opts = {};
+		const opts = Object.create(null);
 		const lines = (value ?? '').split(/\n/);
 		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i].trim();
+			const line = lines[i].trimStart();
 			if (line === '' || line[0] === '#')
 				continue;
-			const m = line.match(/^([a-z0-9_]+)\s*=\s*(.*)$/);
+			const m = line.match(/^([A-Za-z0-9_]+)[ \t]*=[ \t]?(.*)$/s);
 			if (!m)
-				return _('Line %d: expecting name = value, with a lowercase snake_case name').format(i + 1);
+				return _('Line %d: expecting name = value, with letters, digits or underscores in the name').format(i + 1);
 			if (LAW_OPTIONS_RESERVED.includes(m[1]))
-				return _('Line %d: "%s" is set above').format(i + 1, m[1]);
-			if (m[2] === '')
+				return _('Line %d: "%s" is managed by the form').format(i + 1, m[1]);
+			let entry = m[2];
+			if (entry.startsWith('"')) {
+				try {
+					entry = JSON.parse(entry);
+				}
+				catch (error) {
+					return _('Invalid quoted value on line %d').format(i + 1);
+				}
+			}
+			if (entry === '')
 				return _('Line %d: UCI cannot store an empty value').format(i + 1);
-			(opts[m[1]] = opts[m[1]] ?? []).push(m[2]);
+			(opts[m[1]] = opts[m[1]] ?? []).push(entry);
 		}
 		return opts;
 	},
@@ -243,8 +205,10 @@ const FreeformOptions = form.TextValue.extend({
 		for (const k of this._extraOptions(section_id))
 			if (!(k in opts))
 				uci.unset('unravel', section_id, k);
-		for (const k in opts)
-			uci.set('unravel', section_id, k, opts[k].length > 1 ? opts[k] : opts[k][0]);
+		for (const k in opts) {
+			const wasList = Array.isArray(uci.get('unravel', section_id, k));
+			uci.set('unravel', section_id, k, wasList || opts[k].length > 1 ? opts[k] : opts[k][0]);
+		}
 	},
 
 	remove(section_id) {
@@ -264,14 +228,11 @@ function formatKbits(kbits) {
 }
 
 return baseclass.extend({
-	PROFILE_TYPES,
 	LAWS,
-	FreeformOptions,
-	instanceName,
+	ownedSections,
+	addOwnedSection,
+	removeOwnedSections,
 	validateNewName,
-	referencesTo,
-	referenceLabel,
-	guardSection,
 	addLawFields,
 	formatKbits
 });

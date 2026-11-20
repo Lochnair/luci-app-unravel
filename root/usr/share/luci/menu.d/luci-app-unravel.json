@@ -29,21 +29,5 @@
 			"type": "view",
 			"path": "unravel/instances"
 		}
-	},
-	"admin/network/unravel/profiles": {
-		"title": "Profiles",
-		"order": 30,
-		"action": {
-			"type": "view",
-			"path": "unravel/profiles"
-		}
-	},
-	"admin/network/unravel/reflectors": {
-		"title": "Reflectors",
-		"order": 40,
-		"action": {
-			"type": "view",
-			"path": "unravel/reflectors"
-		}
 	}
 }

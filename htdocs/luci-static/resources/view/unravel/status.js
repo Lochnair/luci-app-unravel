@@ -70,12 +70,12 @@ const callInitList = rpc.declare({
 	expect: { '': {} }
 });
 
-// Each running instance publishes `unravel` (unnamed) or `unravel.<name>`
+// Each running instance publishes `unravel.<name>`
 // on ubus, with `status`, `history` and `reflectors`. A stopped one has no
 // object, so the call fails and resolves to null.
 const calls = {};
 function callInstance(name, method) {
-	const object = (name === 'default') ? 'unravel' : 'unravel.' + name;
+	const object = 'unravel.' + name;
 	const key = object + '/' + method;
 	calls[key] = calls[key] ?? rpc.declare({ object, method, expect: { '': {} } });
 	return L.resolveDefault(calls[key](), null);
@@ -310,7 +310,7 @@ return view.extend({
 
 	// A tab per configured instance, built once and updated in place.
 	createPane(s) {
-		const name = common.instanceName(s['.name']);
+		const name = s['.name'];
 		const pane = {
 			name,
 			enabled: !/^(0|false|no|n|off|disabled)$/i.test(s.enabled ?? '1'),
@@ -511,7 +511,9 @@ return view.extend({
 	render([ , init ]) {
 		this.init = init;
 		this.controlsEl = E('div', { 'class': 'cbi-section' });
-		this.panes = uci.sections('unravel', 'network').map((s) => this.createPane(s));
+		this.panes = uci.sections('unravel', 'instance')
+			.filter((s) => !s['.anonymous'])
+			.map((s) => this.createPane(s));
 
 		const map = E('div', { 'class': 'cbi-map' }, E('div', {}, this.panes.map((p) => p.el)));
 		if (this.panes.length)

@@ -3,11 +3,6 @@
 		"description": "Grant access to unRAVEL configuration and status",
 		"read": {
 			"ubus": {
-				"unravel": [
-					"status",
-					"history",
-					"reflectors"
-				],
 				"unravel.*": [
 					"status",
 					"history",

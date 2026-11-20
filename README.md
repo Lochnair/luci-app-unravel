@@ -1,25 +1,23 @@
 # luci-app-unravel
 
-LuCI pages for [unRAVEL](https://github.com/Lochnair/unravel): instances,
-profiles (law, reflector selection, output, metrics export, advanced),
-reflectors, and a status page.
+LuCI pages for [unRAVEL](https://github.com/Lochnair/unravel) status and
+configuration. Each named instance has General, Control law, Reflectors,
+Output and Observability tabs. Reflector inventories, inline reflectors and
+bootstrap hosts are configured on the instance that uses them. Optional
+settings sections can be added from the corresponding tab. Removing an
+instance also removes its owned sections.
 
-Matches the UCI schema on unravel `master` (ffdcce8): multiple instances,
-the sqma and script laws, and per-instance probe binding. The status page
-needs unravel's ubus status (0.6.0-rc1 or later); its graphs and reflector
-table need the `history` and `reflectors` methods that come after
-0.6.0-rc1. The single-WAN default config, with anonymous
-sections, shows up as the "unnamed" instance and profiles.
+Requires unRAVEL's instance-owned UCI schema. The status page uses
+`unravel.<name>` on ubus. Graphs and the reflector table also depend on the
+`history` and `reflectors` methods.
 
 ## Layout
 
 ```
 htdocs/luci-static/resources/
-  unravel/common.js        shared: law fields, references, name checks
+  unravel/common.js        shared law fields and section ownership
   view/unravel/status.js   service control, graphs and reflectors
   view/unravel/instances.js
-  view/unravel/profiles.js
-  view/unravel/reflectors.js
 root/usr/share/
   luci/menu.d/luci-app-unravel.json   Network → unRAVEL
   rpcd/acl.d/luci-app-unravel.json
@@ -28,8 +26,7 @@ root/usr/share/
 ## Status
 
 Each running instance publishes `status`, `history` and `reflectors` on
-ubus, as `unravel` for the unnamed instance and `unravel.<name>` for a named
-one. The page calls them directly every 2 seconds, so no rpcd plugin is
+ubus at `unravel.<name>`. The page calls them directly every 2 seconds, so no rpcd plugin is
 needed. An instance without an object is shown as not running.
 
 `status` is fetched for every instance, since the service controls need it.
